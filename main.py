@@ -1,218 +1,160 @@
 #!/usr/bin/env python3
-"""Roblox Up-and-Coming chart forecaster — make.fun roblox-up-and-coming-forecast-01.
-
-Reads /input/history.ndjson (one Roblox Up-and-Coming chart read per line, each
-with an `at` timestamp and `up_and_coming` rows of {rank, universe_id, playing})
-and /input/task.json ({places, output}), and writes a single ranked forecast:
-{probabilities: [{universe_id, place, p}], top10: [universe_id x places]}.
-
-Python 3.13, standard library only, no network. Outside the grader's
-container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and
-/output:
-    mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
-
-Approach — the chart churns fast (in the practice history the top 10 changed
-in 42 of 44 consecutive reads, median 6 places), so a plain persistence
-forecast and raw history frequencies both lose: frequencies are stale within
-a day, persistence trusts one noisy read too much. This forecaster blends
-three signals per place, then spends probability where it pays:
-
-1. Time-weighted place frequencies (half-life 24h): how often each game
-   actually held each place, with recent reads weighted more.
-2. A Gaussian kernel around each game's drift-adjusted predicted rank:
-   last rank plus the mean rank drift over the last 5 reads, times 2. The
-   kernel (sigma 4 places) spreads mass over the places a game could
-   plausibly land on during the 72h window, instead of betting on one.
-3. A 20% blend with the persistence baseline (the kit starter's forecast):
-   it steadies the model on the rare reads where the chart barely moves.
-
-Per place, only the 12 most probable games are named, rescaled to sum to
-0.45; the remaining 0.55 stays unnamed, shared equally by every game the
-place does not name. That matters because the log score floors a miss at
-ln(1e-4) = -9.21: with ~90 games on the chart, the unnamed share is about
-0.006 per game (ln -5.1), far better than the floor, so naming a game whose
-true probability is below the unnamed share would hurt. The top10 point
-guess is the 10 games with the lowest expected rank.
-
-Tuning (walk-forward backtests on the kit's 34 practice snapshots, scored
-with the contest's own log-score rule, three splits: train 0-19 / 0-24 /
-0-29, tested on the reads after each cut):
-    baseline (persistence starter):  -1330.22 total over 27 test reads
-    this forecaster:                 -1083.21 total over 27 test reads
-    improvement:                     +247.01 nats (+9.1 per read, +0.91
-                                     per place per read)
-The tuned parameters (half-life 24h, kernel weight 0.6, sigma 4.0, cap 0.45,
-blend 0.2, drift factor 2.0) sit on a flat optimum: neighbouring settings
-score within ~2 nats, so the model is not knife-edge tuned to one split.
-"""
+"""Forecast Roblox Up-and-Coming chart places from its recorded history."""
 
 import json
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 
-INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
-PLACES_FALLBACK = 10
+PLACES = 10
 HALF_LIFE_HOURS = 24.0
 KERNEL_WEIGHT = 0.6
 KERNEL_SIGMA = 4.0
-NAMED_CAP = 0.45
-TOP_N_PER_PLACE = 12
-BASELINE_BLEND = 0.2
-DRIFT_FACTOR = 2.0
-DRIFT_LOOKBACK = 5
+DRIFT_MULTIPLIER = 2.0
+PERSISTENCE_BLEND = 0.2
+NAMED_MASS = 0.45
+NAMED_GAMES = 12
 
 
-def parse_time(value):
-    """Parse an ISO-8601 timestamp (with a trailing Z) into an aware datetime."""
-    if isinstance(value, str):
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return None
+def timestamp(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def load_history(path):
-    """Return a list of snapshots: {at, chart, playing, rankof}."""
+def read_history(path):
     snapshots = []
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
+    with open(path, "r", encoding="utf-8") as source:
+        for line in source:
+            if not line.strip():
                 continue
             raw = json.loads(line)
-            rows = raw.get("up_and_coming") or []
-            if not rows:
-                continue
-            rows = sorted(rows, key=lambda r: r.get("rank", 10**9))
-            chart = [int(r["universe_id"]) for r in rows]
-            playing = {}
-            rankof = {}
-            for r in rows:
-                uid = int(r["universe_id"])
-                rankof[uid] = int(r.get("rank", 0))
-                value = r.get("playing")
-                playing[uid] = int(value) if isinstance(value, (int, float)) else 0
-            at = parse_time(raw.get("at")) or datetime.now(timezone.utc)
-            snapshots.append({"at": at, "chart": chart, "playing": playing, "rankof": rankof})
-    snapshots.sort(key=lambda s: s["at"])
+            rows = sorted(raw.get("up_and_coming") or [], key=lambda row: row["rank"])
+            chart = [int(row["universe_id"]) for row in rows]
+            snapshots.append({
+                "time": timestamp(raw["at"]),
+                "chart": chart,
+                "rank": {uid: i + 1 for i, uid in enumerate(chart)},
+            })
     return snapshots
 
 
-def baseline_forecast(last_chart, places):
-    """The kit starter's persistence forecast, as a {place: {uid: p}} map."""
-    forecast = {}
-    for place in range(1, places + 1):
-        # A short chart (fewer rows than places) cannot name every place;
-        # leave the missing places empty instead of crashing the run.
-        if place - 1 >= len(last_chart):
-            forecast[place] = {}
-            continue
-        named = {last_chart[place - 1]: 0.5}
-        if place == 1:
-            if len(last_chart) > 1:
-                named[last_chart[1]] = 0.3
-        else:
-            named[last_chart[place - 2]] = 0.15
-            if place < len(last_chart):
-                named[last_chart[place]] = 0.15
-        forecast[place] = named
-    return forecast
-
-
-def build_forecast(snapshots, places):
-    """Return ({place: {uid: p}}, top10) for the given history."""
-    last = snapshots[-1]
-    last_chart = last["chart"]
-    end = last["at"]
-
-    # 1. Time-weighted place frequencies.
-    freq = {k: {} for k in range(1, places + 1)}
-    weight_sum = {k: 0.0 for k in range(1, places + 1)}
-    for snap in snapshots:
-        age_h = (end - snap["at"]).total_seconds() / 3600.0
-        weight = 0.5 ** (age_h / HALF_LIFE_HOURS)
-        for k in range(1, places + 1):
-            if k - 1 >= len(snap["chart"]):
-                continue
-            uid = snap["chart"][k - 1]
-            freq[k][uid] = freq[k].get(uid, 0.0) + weight
-            weight_sum[k] += weight
-
-    # 2. Drift-adjusted predicted rank per game (mean drift over the last
-    #    few reads, extrapolated two steps ahead).
-    predicted_rank = {}
-    start = max(0, len(snapshots) - DRIFT_LOOKBACK)
-    for uid, rank in last["rankof"].items():
-        drifts = []
-        for j in range(start, len(snapshots) - 1):
-            before, after = snapshots[j], snapshots[j + 1]
-            if uid in before["rankof"] and uid in after["rankof"]:
-                drifts.append(after["rankof"][uid] - before["rankof"][uid])
-        drift = sum(drifts) / len(drifts) if drifts else 0.0
-        predicted_rank[uid] = rank + DRIFT_FACTOR * drift
-
-    # 3. Combine per place: frequency + kernel, name the top 12, cap at 0.45.
-    model = {}
-    for k in range(1, places + 1):
+def persistence_forecast(last_chart):
+    result = {}
+    for place in range(1, PLACES + 1):
         probs = {}
-        total = weight_sum[k]
+        if place <= len(last_chart):
+            probs[last_chart[place - 1]] = 0.5
+            if place == 1:
+                if len(last_chart) > 1:
+                    probs[last_chart[1]] = 0.3
+            else:
+                probs[last_chart[place - 2]] = 0.15
+                if place < len(last_chart):
+                    probs[last_chart[place]] = 0.15
+        result[place] = probs
+    return result
+
+
+def forecast(snapshots):
+    if not snapshots:
+        raise ValueError("history.ndjson contains no snapshots")
+
+    latest = snapshots[-1]
+    last_chart = latest["chart"]
+    baseline = persistence_forecast(last_chart)
+    freq = {place: {} for place in range(1, PLACES + 1)}
+    weight_sums = {place: 0.0 for place in range(1, PLACES + 1)}
+
+    for snapshot in snapshots:
+        age = (latest["time"] - snapshot["time"]).total_seconds() / 3600.0
+        weight = 0.5 ** (max(0.0, age) / HALF_LIFE_HOURS)
+        for place in range(1, min(PLACES, len(snapshot["chart"])) + 1):
+            uid = snapshot["chart"][place - 1]
+            freq[place][uid] = freq[place].get(uid, 0.0) + weight
+            weight_sums[place] += weight
+
+    # Rank drift is the mean rank change over the last five adjacent reads
+    # where the game appeared in both reads. Positive drift means falling.
+    predicted_rank = {}
+    lookback_start = max(0, len(snapshots) - 5)
+    for uid, rank in latest["rank"].items():
+        changes = []
+        for index in range(lookback_start, len(snapshots) - 1):
+            older = snapshots[index]["rank"]
+            newer = snapshots[index + 1]["rank"]
+            if uid in older and uid in newer:
+                changes.append(newer[uid] - older[uid])
+        drift = sum(changes) / len(changes) if changes else 0.0
+        predicted_rank[uid] = rank + drift * DRIFT_MULTIPLIER
+
+    probabilities = {}
+    for place in range(1, PLACES + 1):
+        base = {}
+        if weight_sums[place] > 0:
+            base = {uid: value / weight_sums[place]
+                    for uid, value in freq[place].items()}
+
+        scores = dict(base)
+        for uid, predicted in predicted_rank.items():
+            distance = (predicted - place) / KERNEL_SIGMA
+            scores[uid] = scores.get(uid, 0.0) + KERNEL_WEIGHT * math.exp(-0.5 * distance * distance)
+
+        total = sum(scores.values())
         if total > 0:
-            for uid, w in freq[k].items():
-                probs[uid] = w / total
-        for uid, rank in predicted_rank.items():
-            gauss = math.exp(-0.5 * ((rank - k) / KERNEL_SIGMA) ** 2)
-            probs[uid] = probs.get(uid, 0.0) + KERNEL_WEIGHT * gauss
-        norm = sum(probs.values())
-        if norm <= 0:
-            model[k] = {}
-            continue
-        probs = {uid: p / norm for uid, p in probs.items()}
-        top = sorted(probs.items(), key=lambda item: -item[1])[:TOP_N_PER_PLACE]
-        top_sum = sum(p for _, p in top)
-        model[k] = {uid: p / top_sum * NAMED_CAP for uid, p in top} if top_sum > 0 else {}
+            scores = {uid: value / total for uid, value in scores.items()}
+        # Keep insertion order for exact ties, matching the stable ordering of
+        # the frequency map used to evaluate the tuned model.
+        selected = sorted(scores.items(), key=lambda item: -item[1])[:NAMED_GAMES]
+        selected_total = sum(value for _, value in selected)
+        model_probs = ({uid: value * NAMED_MASS / selected_total
+                        for uid, value in selected} if selected_total else {})
 
-    # 4. Blend with the persistence baseline.
-    baseline = baseline_forecast(last_chart, places)
-    forecast = {}
-    for k in range(1, places + 1):
-        merged = {}
-        for uid, p in model[k].items():
-            merged[uid] = merged.get(uid, 0.0) + (1.0 - BASELINE_BLEND) * p
-        for uid, p in baseline[k].items():
-            merged[uid] = merged.get(uid, 0.0) + BASELINE_BLEND * p
-        forecast[k] = merged
+        combined = {}
+        for uid, value in model_probs.items():
+            combined[uid] = combined.get(uid, 0.0) + (1.0 - PERSISTENCE_BLEND) * value
+        for uid, value in baseline[place].items():
+            combined[uid] = combined.get(uid, 0.0) + PERSISTENCE_BLEND * value
+        probabilities[place] = combined
 
-    # Top 10: the games with the lowest expected rank.
-    expected_rank = {}
-    for k in range(1, places + 1):
-        for uid, p in forecast[k].items():
-            expected_rank[uid] = expected_rank.get(uid, 0.0) + k * p
-    for uid in last["rankof"]:
-        expected_rank.setdefault(uid, places + 5.0)
-    top10 = sorted(expected_rank, key=lambda uid: expected_rank[uid])[:places]
-    return forecast, top10
+    # Rank games by expected place from the per-place named probabilities.
+    # A game with no named mass receives the same outside-chart estimate used
+    # in the tuning backtest.
+    expected = {}
+    for place, games in probabilities.items():
+        for uid, probability in games.items():
+            expected[uid] = expected.get(uid, 0.0) + place * probability
+    for uid in last_chart:
+        expected.setdefault(uid, float(PLACES + 5))
+
+    ordered = sorted(expected, key=lambda uid: (expected[uid], uid))
+    top10 = ordered[:PLACES]
+    if len(top10) < PLACES:
+        # Contract requires ten distinct ids even for an unusually short chart.
+        candidate = 1
+        used = set(top10)
+        while len(top10) < PLACES:
+            if candidate not in used:
+                top10.append(candidate)
+                used.add(candidate)
+            candidate += 1
+
+    rows = []
+    for place in range(1, PLACES + 1):
+        for uid, probability in sorted(probabilities[place].items()):
+            if probability > 0.0:
+                rows.append({"universe_id": uid, "place": place, "p": probability})
+    return {"probabilities": rows, "top10": top10}
 
 
 def main():
-    with open(os.path.join(INPUT_DIR, "task.json"), "r", encoding="utf-8") as handle:
-        task = json.load(handle)
-    places = int(task.get("places", PLACES_FALLBACK))
-    output_name = task.get("output", "forecast.json")
-
-    snapshots = load_history(os.path.join(INPUT_DIR, "history.ndjson"))
-    if not snapshots:
-        raise SystemExit("no snapshots in history.ndjson")
-    forecast, top10 = build_forecast(snapshots, places)
-
-    probabilities = []
-    for place in range(1, places + 1):
-        for uid, p in sorted(forecast[place].items(), key=lambda item: -item[1]):
-            probabilities.append({"universe_id": uid, "place": place, "p": round(p, 6)})
-    document = {"probabilities": probabilities, "top10": top10}
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(os.path.join(OUTPUT_DIR, output_name), "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(document) + "\n")
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    result = forecast(read_history(os.path.join(input_dir, "history.ndjson")))
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, "forecast.json")
+    with open(output_path, "w", encoding="utf-8", newline="\n") as output:
+        json.dump(result, output, separators=(",", ":"), ensure_ascii=False)
+        output.write("\n")
 
 
 if __name__ == "__main__":
