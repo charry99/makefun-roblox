@@ -1,28 +1,23 @@
-# Roblox Up-and-Coming forecaster
+# Roblox Up-and-Coming Forecaster
 
-This entry forecasts each of the chart's first ten places independently from
-the snapshots in `history.ndjson`. It combines exponentially time-weighted
-observed place frequencies (24-hour half-life) with a Gaussian rank kernel
-(weight 0.6, sigma 4 places). The kernel center adjusts each currently listed
-game's rank by twice its mean rank movement over the last five adjacent reads.
+A deterministic Python 3 forecaster for the Roblox Up-and-Coming chart. It reads the supplied snapshots and writes one place-by-place forecast without network access or third-party packages.
 
-For each place, the twelve highest scoring games in the frequency/kernel
-model share 0.45 probability mass. The forecast then blends that model with
-the persistence baseline at 80/20. Persistence assigns 0.5 to the current
-game at that place and its neighboring-place probabilities as specified by
-the competition starter. The unassigned probability is the unnamed chart
-mass. `top10` orders games by their summed expected place across the named
-probabilities.
+## Forecast model
 
-The implementation uses only the Python standard library and is deterministic.
-It reads `MAKEFUN_INPUT_DIR/history.ndjson` (default `/input/history.ndjson`)
-and writes `MAKEFUN_OUTPUT_DIR/forecast.json` (default `/output/forecast.json`).
+For each of the first ten places, the forecast combines three signals:
 
-Run it with:
+1. Historical place frequencies, weighted by a 24-hour half-life.
+2. A Gaussian rank kernel with weight 0.6 and a four-place standard deviation. The kernel is centered on each game's last observed rank adjusted by its average movement over up to the last five read-to-read transitions, projected by a factor of two.
+3. The persistence distribution from the competition starter, blended at 20%.
 
-```sh
-python3 main.py
-```
+The highest twelve games in the frequency-plus-kernel distribution are named at each place and scaled to 0.45 total probability before the persistence blend. Remaining mass is left unnamed, as the scoring contract requires. The top-ten order is estimated from the named probability-weighted ranks. Ties are resolved by universe ID, making repeat runs byte-identical.
 
-When running locally, set `MAKEFUN_INPUT_DIR` and `MAKEFUN_OUTPUT_DIR` to
-directories containing the input files and receiving the forecast.
+The model handles short charts by only using observed places for frequency and by omitting unavailable persistence neighbors. One- and two-snapshot histories use zero drift where there are too few shared observations.
+
+## Run
+
+The default input and output directories are /input and /output. Locally, set the environment variables to point to the competition input and a writable output directory:
+
+    MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=/path/to/output python3 main.py
+
+The program reads history.ndjson and, when present, task.json; it writes forecast.json.
