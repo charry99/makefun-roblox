@@ -103,6 +103,11 @@ def baseline_forecast(last_chart, places):
     """The kit starter's persistence forecast, as a {place: {uid: p}} map."""
     forecast = {}
     for place in range(1, places + 1):
+        # A short chart (fewer rows than places) cannot name every place;
+        # leave the missing places empty instead of crashing the run.
+        if place - 1 >= len(last_chart):
+            forecast[place] = {}
+            continue
         named = {last_chart[place - 1]: 0.5}
         if place == 1:
             if len(last_chart) > 1:
