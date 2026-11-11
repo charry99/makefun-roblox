@@ -1,23 +1,17 @@
 # Roblox Up-and-Coming Forecaster
 
-A deterministic Python 3 forecaster for the Roblox Up-and-Coming chart. It reads the supplied snapshots and writes one place-by-place forecast without network access or third-party packages.
+This entry forecasts each of the first ten chart places independently using only the supplied history. It uses Python 3.13 and the standard library; it makes no network requests and uses no randomness.
 
-## Forecast model
+For every place, the forecast combines time-weighted historical place frequencies (24-hour half-life) with a Gaussian kernel centered on each game's latest rank adjusted by its mean rank drift over up to the last five reads. The kernel weight is 0.6 with a four-place standard deviation. It keeps the twelve most likely named games and rescales their probabilities to a total of 0.45. A 20% blend of the persistence baseline adds probability to the latest chart order and its immediate neighbors.
 
-For each of the first ten places, the forecast combines three signals:
-
-1. Historical place frequencies, weighted by a 24-hour half-life.
-2. A Gaussian rank kernel with weight 0.6 and a four-place standard deviation. The kernel is centered on each game's last observed rank adjusted by its average movement over up to the last five read-to-read transitions, projected by a factor of two.
-3. The persistence distribution from the competition starter, blended at 20%.
-
-The highest twelve games in the frequency-plus-kernel distribution are named at each place and scaled to 0.45 total probability before the persistence blend. Remaining mass is left unnamed, as the scoring contract requires. The top-ten order is estimated from the named probability-weighted ranks. Ties are resolved by universe ID, making repeat runs byte-identical.
-
-The model handles short charts by only using observed places for frequency and by omitting unavailable persistence neighbors. One- and two-snapshot histories use zero drift where there are too few shared observations.
+The returned top10 is ordered by each candidate's expected rank using the named place probabilities, with deterministic universe-id tie-breaking. Histories with one or two snapshots work without drift estimates; missing places on short charts are skipped, and missing persistence neighbors are omitted.
 
 ## Run
 
-The default input and output directories are /input and /output. Locally, set the environment variables to point to the competition input and a writable output directory:
+Place history.ndjson and task.json in the input directory, then run:
 
     MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=/path/to/output python3 main.py
 
-The program reads history.ndjson and, when present, task.json; it writes forecast.json.
+The default directories are /input and /output. The program writes forecast.json to the output directory. task.json may set places and output; absent values default to ten places and forecast.json.
+
+The output has exactly two top-level keys: probabilities, with rows containing universe_id, place, and p, and top10, a list of ten distinct universe ids.
